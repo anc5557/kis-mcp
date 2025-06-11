@@ -25,6 +25,22 @@
 - **python-kis:** 한국투자증권 API를 Python 환경에서 사용하기 위한 라이브러리입니다.
 - **Pydantic:** 데이터 유효성 검사 및 설정 관리를 위해 사용됩니다.
 
+## 환경변수 설정
+
+먼저 `env.example` 파일을 참고하여 환경변수를 설정하세요:
+
+1. `env.example`을 `.env`로 복사
+2. KIS 개발자센터에서 발급받은 API 정보를 입력
+3. 모의투자(`VIRTUAL_TRADING=true`) 또는 실전투자(`false`) 선택
+
+```bash
+# Windows PowerShell
+copy env.example .env
+
+# macOS/Linux  
+cp env.example .env
+```
+
 ## 실행 방법
 
     서버는 두 가지 transport 방식을 지원합니다:
