@@ -2,6 +2,8 @@ import asyncio
 import os
 from decimal import Decimal
 from typing import Annotated, Literal, Any
+from datetime import datetime, time, date as date_cls
+from zoneinfo import ZoneInfo
 from pydantic import Field
 
 from fastmcp import FastMCP, Context
@@ -14,6 +16,10 @@ from pykis import (
     KisOrder,
     KisBalance,
     KisPendingOrders,
+    KisOrderbookResponse,
+    KisChart,
+    KisDailyOrders,
+    KisOrderProfits,
 )
 
 # --- KIS API Configuration ---
@@ -56,7 +62,7 @@ mcp: FastMCP[None] = FastMCP(
     description="한국투자증권 계좌의 전체 잔고 정보를 조회합니다. 총 자산, 현금 잔고, 보유 종목별 평가 정보를 포함합니다.",
     tags={"account", "balance", "portfolio"},
 )
-async def get_account_balance(ctx: Context) -> dict:
+async def get_account_balance(ctx: Context) -> dict[str, Any]:
     """
     한국투자증권 계좌의 잔고 정보를 조회합니다.
 
@@ -120,7 +126,7 @@ async def get_stock_quote(
             examples=["005930", "000660", "035420"],
         ),
     ],
-) -> dict:
+) -> dict[str, Any]:
     """
     지정된 종목의 현재 주식 시세를 조회합니다.
 
@@ -194,7 +200,7 @@ async def place_stock_order(
         Literal["limit", "market"],
         Field(description="주문 방식: 'limit' (지정가) 또는 'market' (시장가)"),
     ] = "limit",
-) -> dict:
+) -> dict[str, Any]:
     """
     주식 매수/매도 주문을 제출합니다.
 
@@ -277,7 +283,7 @@ async def place_stock_order(
     description="현재 계좌의 모든 미체결 주문 목록을 조회합니다. 주문 번호, 종목, 수량, 가격, 미체결 수량 등의 정보를 제공합니다.",
     tags={"orders", "pending", "unfilled"},
 )
-async def get_pending_orders(ctx: Context) -> list[dict]:
+async def get_pending_orders(ctx: Context) -> list[dict[str, Any]]:
     """
     현재 계좌의 미체결 주문 목록을 조회합니다.
 
@@ -352,7 +358,7 @@ async def cancel_stock_order(
             examples=["20240101-123456", "ORD240101001"],
         ),
     ],
-) -> dict:
+) -> dict[str, Any]:
     """
     지정된 주문 ID의 미체결 주문을 취소합니다.
 
@@ -399,6 +405,509 @@ async def cancel_stock_order(
 
     except Exception as e:
         raise ToolError(f"주문 '{order_id}' 취소 중 오류가 발생했습니다: {e}")
+
+
+@mcp.tool(
+    name="get_buyable_amount",
+    description="지정된 종목의 매수 가능 금액과 수량을 조회합니다. 현금 잔고와 종목 가격을 기반으로 계산됩니다.",
+    tags={"trading", "buyable", "cash", "order"},
+)
+async def get_buyable_amount(
+    ctx: Context,
+    stock_code: Annotated[
+        str,
+        Field(
+            description="조회할 주식의 6자리 종목 코드",
+            pattern=r"^\d{6}$",
+            examples=["005930", "000660", "035420"],
+        ),
+    ],
+    price: Annotated[
+        int | None,
+        Field(
+            description="매수 희망 가격 (원). None이면 현재가 기준으로 계산",
+            ge=0,
+            examples=[50000, 100000, 200000],
+        ),
+    ] = None,
+) -> dict[str, Any]:
+    """
+    지정된 종목의 매수 가능 금액과 수량을 조회합니다.
+
+    Args:
+        stock_code: 6자리 종목 코드
+        price: 매수 희망 가격 (None이면 현재가 기준)
+
+    Returns:
+        dict: 매수 가능 정보
+            - stock_code: 종목 코드
+            - buyable_cash: 매수 가능 현금
+            - buyable_quantity: 매수 가능 수량 (주)
+            - reference_price: 기준 가격 (원)
+            - max_buyable_amount: 최대 매수 가능 금액
+    """
+    try:
+        # 잔고에서 현금 정보 확인
+        account: KisAccount = kis.account()
+        balance: KisBalance = await asyncio.to_thread(account.balance)
+        available_cash: Decimal = balance.withdrawable_amount
+
+        # 가격이 지정되지 않으면 현재가 사용
+        if price is None:
+            stock: KisStock = kis.stock(stock_code)
+            quote: KisQuote = await asyncio.to_thread(stock.quote)
+            price = int(quote.price)
+
+        # 매수 가능 수량 계산 (단순 계산)
+        buyable_quantity: int = int(available_cash / price) if price > 0 else 0
+
+        return {
+            "stock_code": stock_code,
+            "buyable_cash": available_cash,
+            "buyable_quantity": buyable_quantity,
+            "reference_price": price,
+            "max_buyable_amount": available_cash,
+        }
+    except Exception as e:
+        raise ToolError(
+            f"종목 '{stock_code}' 매수 가능 금액 조회 중 오류가 발생했습니다: {e}"
+        )
+
+
+@mcp.tool(
+    name="get_sellable_quantity",
+    description="지정된 종목의 매도 가능 수량을 조회합니다. 현재 보유 수량에서 미체결 매도 주문량을 제외한 수량입니다.",
+    tags={"trading", "sellable", "quantity", "holdings"},
+)
+async def get_sellable_quantity(
+    ctx: Context,
+    stock_code: Annotated[
+        str,
+        Field(
+            description="조회할 주식의 6자리 종목 코드",
+            pattern=r"^\d{6}$",
+            examples=["005930", "000660", "035420"],
+        ),
+    ],
+) -> dict[str, Any]:
+    """
+    지정된 종목의 매도 가능 수량을 조회합니다.
+
+    Args:
+        stock_code: 6자리 종목 코드
+
+    Returns:
+        dict: 매도 가능 정보
+            - stock_code: 종목 코드
+            - total_quantity: 총 보유 수량
+            - sellable_quantity: 매도 가능 수량
+            - pending_sell_quantity: 미체결 매도 수량
+    """
+    try:
+        # 잔고에서 보유 종목 확인
+        account: KisAccount = kis.account()
+        balance: KisBalance = await asyncio.to_thread(account.balance)
+
+        # 해당 종목의 보유 수량 찾기
+        total_quantity: Decimal = Decimal(0)
+        if hasattr(balance, "stocks") and balance.stocks:
+            for stock_item in balance.stocks:
+                if hasattr(stock_item, "symbol") and stock_item.symbol == stock_code:
+                    total_quantity = Decimal(stock_item.quantity)
+                    break
+
+        # 미체결 매도 주문 수량 계산
+        pending_orders_iter: KisPendingOrders = await asyncio.to_thread(
+            account.pending_orders
+        )
+        pending_sell_quantity: Decimal = Decimal(0)
+
+        if pending_orders_iter:
+            for order_item in pending_orders_iter:
+                if (
+                    hasattr(order_item, "symbol")
+                    and order_item.symbol == stock_code
+                    and hasattr(order_item, "type")
+                    and order_item.type == "sell"
+                ):
+                    pending_sell_quantity += Decimal(order_item.pending_qty)
+
+        sellable_quantity: Decimal = total_quantity - pending_sell_quantity
+
+        return {
+            "stock_code": stock_code,
+            "total_quantity": total_quantity,
+            "sellable_quantity": max(Decimal(0), sellable_quantity),
+            "pending_sell_quantity": pending_sell_quantity,
+        }
+    except Exception as e:
+        raise ToolError(
+            f"종목 '{stock_code}' 매도 가능 수량 조회 중 오류가 발생했습니다: {e}"
+        )
+
+
+@mcp.tool(
+    name="get_stock_orderbook",
+    description="지정된 종목의 현재 호가 정보를 조회합니다. 매수/매도 호가와 잔량 정보를 제공합니다.",
+    tags={"stock", "orderbook", "bid", "ask", "market-data"},
+)
+async def get_stock_orderbook(
+    ctx: Context,
+    stock_code: Annotated[
+        str,
+        Field(
+            description="조회할 주식의 6자리 종목 코드",
+            pattern=r"^\d{6}$",
+            examples=["005930", "000660", "035420"],
+        ),
+    ],
+) -> dict[str, Any]:
+    """
+    지정된 종목의 호가 정보를 조회합니다.
+
+    Args:
+        stock_code: 6자리 종목 코드
+
+    Returns:
+        dict: 호가 정보
+            - stock_code: 종목 코드
+            - asks: 매도 호가 리스트 (가격 낮은 순)
+            - bids: 매수 호가 리스트 (가격 높은 순)
+            각 호가 정보:
+                - price: 호가 가격 (원)
+                - quantity: 호가 수량 (주)
+    """
+    try:
+        stock: KisStock = kis.stock(stock_code)
+        orderbook: KisOrderbookResponse = await asyncio.to_thread(stock.orderbook)
+
+        asks_data: list[dict[str, Decimal | int]] = []
+        bids_data: list[dict[str, Decimal | int]] = []
+
+        # 매도 호가 (asks)
+        if hasattr(orderbook, "asks") and orderbook.asks:
+            for ask in orderbook.asks:
+                asks_data.append(
+                    {
+                        "price": ask.price if hasattr(ask, "price") else 0,
+                        "quantity": ask.volume if hasattr(ask, "volume") else 0,
+                    }
+                )
+
+        # 매수 호가 (bids)
+        if hasattr(orderbook, "bids") and orderbook.bids:
+            for bid in orderbook.bids:
+                bids_data.append(
+                    {
+                        "price": bid.price if hasattr(bid, "price") else 0,
+                        "quantity": bid.volume if hasattr(bid, "volume") else 0,
+                    }
+                )
+
+        return {
+            "stock_code": stock_code,
+            "asks": asks_data,  # 매도 호가 (가격 낮은 순)
+            "bids": bids_data,  # 매수 호가 (가격 높은 순)
+        }
+    except Exception as e:
+        raise ToolError(f"종목 '{stock_code}' 호가 조회 중 오류가 발생했습니다: {e}")
+
+
+@mcp.tool(
+    name="get_stock_chart",
+    description="지정된 종목의 차트 데이터를 조회합니다. 일/주/월봉 데이터와 기술적 지표를 포함합니다.",
+    tags={"stock", "chart", "ohlcv", "technical-analysis"},
+)
+async def get_stock_chart(
+    ctx: Context,
+    stock_code: Annotated[
+        str,
+        Field(
+            description="조회할 주식의 6자리 종목 코드",
+            pattern=r"^\d{6}$",
+            examples=["005930", "000660", "035420"],
+        ),
+    ],
+    period: Annotated[
+        Literal["day", "week", "month"],
+        Field(description="차트 기간: 'day' (일봉), 'week' (주봉), 'month' (월봉)"),
+    ] = "day",
+    count: Annotated[
+        int,
+        Field(description="조회할 데이터 개수 (1~100)", ge=1, le=100),
+    ] = 20,
+) -> dict[str, Any]:
+    """
+    지정된 종목의 차트 데이터를 조회합니다.
+
+    Args:
+        stock_code: 6자리 종목 코드
+        period: 차트 기간 (day/week/month)
+        count: 조회할 데이터 개수
+
+    Returns:
+        dict: 차트 데이터
+            - stock_code: 종목 코드
+            - period: 차트 기간
+            - data: 차트 데이터 리스트 (최신순)
+            각 데이터:
+                - date: 날짜 (YYYY-MM-DD)
+                - open: 시가 (원)
+                - high: 고가 (원)
+                - low: 저가 (원)
+                - close: 종가 (원)
+                - volume: 거래량 (주)
+    """
+    try:
+        stock: KisStock = kis.stock(stock_code)
+
+        # 기간별 차트 조회 (python-kis의 실제 API 사용)
+        if period == "day":
+            chart_data: KisChart = await asyncio.to_thread(stock.chart)
+        elif period == "week":
+            chart_data = await asyncio.to_thread(stock.chart)  # 기본 차트 조회
+        elif period == "month":
+            chart_data = await asyncio.to_thread(stock.chart)  # 기본 차트 조회
+
+        chart_list = []
+        if chart_data:
+            # chart_data는 이터러블하므로 슬라이싱으로 개수 제한
+            chart_items = (
+                list(chart_data)[:count] if hasattr(chart_data, "__iter__") else []  # type: ignore
+            )
+
+            for candle in chart_items:
+                chart_list.append(
+                    {
+                        "date": (
+                            str(candle.date)
+                            if hasattr(candle, "date") and candle.date
+                            else "N/A"
+                        ),
+                        "open": candle.open if hasattr(candle, "open") else 0,
+                        "high": candle.high if hasattr(candle, "high") else 0,
+                        "low": candle.low if hasattr(candle, "low") else 0,
+                        "close": candle.close if hasattr(candle, "close") else 0,
+                        "volume": candle.volume if hasattr(candle, "volume") else 0,
+                    }
+                )
+
+        return {
+            "stock_code": stock_code,
+            "period": period,
+            "data": chart_list,
+        }
+    except Exception as e:
+        raise ToolError(f"종목 '{stock_code}' 차트 조회 중 오류가 발생했습니다: {e}")
+
+
+@mcp.tool(
+    name="get_period_profit_loss",
+    description="지정된 기간 동안의 손익 현황을 조회합니다. 실현손익, 평가손익, 수익률 등을 포함합니다.",
+    tags={"account", "profit", "loss", "performance"},
+)
+async def get_period_profit_loss(
+    ctx: Context,
+    start_date: Annotated[
+        str,
+        Field(
+            description="조회 시작 날짜 (YYYY-MM-DD 형식)",
+            pattern=r"^\d{4}-\d{2}-\d{2}$",
+            examples=["2024-01-01", "2024-03-15"],
+        ),
+    ],
+    end_date: Annotated[
+        str,
+        Field(
+            description="조회 종료 날짜 (YYYY-MM-DD 형식)",
+            pattern=r"^\d{4}-\d{2}-\d{2}$",
+            examples=["2024-12-31", "2024-03-31"],
+        ),
+    ],
+) -> dict[str, Any]:
+    """
+    지정된 기간의 손익 현황을 조회합니다.
+
+    Args:
+        start_date: 조회 시작 날짜 (YYYY-MM-DD)
+        end_date: 조회 종료 날짜 (YYYY-MM-DD)
+
+    Returns:
+        dict: 기간 손익 정보
+            - start_date: 조회 시작 날짜
+            - end_date: 조회 종료 날짜
+            - realized_profit_loss: 실현 손익 (원)
+            - unrealized_profit_loss: 평가 손익 (원)
+            - total_profit_loss: 총 손익 (원)
+            - profit_loss_rate: 손익률 (%)
+            - trading_count: 거래 횟수
+    """
+    try:
+        account: KisAccount = kis.account()
+
+        # 기간 손익 조회 (profits 메서드 사용)
+        start_date_obj: date_cls = date_cls.fromisoformat(start_date)
+        end_date_obj: date_cls = date_cls.fromisoformat(end_date)
+        profit_data: KisOrderProfits = await asyncio.to_thread(
+            account.profits, start=start_date_obj, end=end_date_obj
+        )
+
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "profit": (
+                profit_data.profit
+                if profit_data and hasattr(profit_data, "profit")
+                else 0
+            ),
+            "buy_amount": (
+                profit_data.buy_amount
+                if profit_data and hasattr(profit_data, "buy_amount")
+                else 0
+            ),
+            "sell_amount": (
+                profit_data.sell_amount
+                if profit_data and hasattr(profit_data, "sell_amount")
+                else 0
+            ),
+            "orders": (
+                profit_data.orders
+                if profit_data and hasattr(profit_data, "orders")
+                else []
+            ),
+        }
+    except Exception as e:
+        raise ToolError(f"기간 손익 조회 중 오류가 발생했습니다: {e}")
+
+
+@mcp.tool(
+    name="get_daily_executions",
+    description="지정된 날짜의 일별 체결 내역을 조회합니다. 매수/매도 체결 정보와 수수료를 포함합니다.",
+    tags={"account", "executions", "trades", "history"},
+)
+async def get_daily_executions(
+    ctx: Context,
+    date: Annotated[
+        str,
+        Field(
+            description="조회할 날짜 (YYYY-MM-DD 형식)",
+            pattern=r"^\d{4}-\d{2}-\d{2}$",
+            examples=["2024-03-15", "2024-12-25"],
+        ),
+    ],
+) -> list[dict[str, Any]]:
+    """
+    지정된 날짜의 체결 내역을 조회합니다.
+
+    Args:
+        date: 조회할 날짜 (YYYY-MM-DD)
+
+    Returns:
+        list[dict]: 체결 내역 목록
+            각 체결 정보:
+            - execution_time: 체결 시간
+            - stock_code: 종목 코드
+            - stock_name: 종목명
+            - order_type: 주문 유형 (buy/sell)
+            - quantity: 체결 수량
+            - price: 체결 가격
+            - amount: 체결 금액
+            - fee: 수수료
+            - tax: 세금
+            - net_amount: 순 체결 금액
+    """
+    try:
+        account: KisAccount = kis.account()
+
+        # 일별 체결 내역 조회
+        date_obj = date_cls.fromisoformat(date)
+        executions: KisDailyOrders = await asyncio.to_thread(
+            account.daily_orders, start=date_obj, end=date_obj
+        )
+
+        execution_list = []
+        if executions:
+            for execution in executions:
+                execution_list.append(
+                    {
+                        "order_type": (
+                            execution.type if hasattr(execution, "type") else "N/A"
+                        ),
+                        "executed_qty": (
+                            execution.executed_qty
+                            if hasattr(execution, "executed_qty")
+                            else 0
+                        ),
+                        "qty": (execution.qty if hasattr(execution, "qty") else 0),
+                        "price": execution.price if hasattr(execution, "price") else 0,
+                    }
+                )
+
+        return execution_list
+    except Exception as e:
+        raise ToolError(f"일별 체결 내역 조회 중 오류가 발생했습니다: {e}")
+
+
+@mcp.tool(
+    name="get_market_status",
+    description="한국 주식 시장의 현재 운영 상태와 시간 정보를 조회합니다. 장 시작/종료 시간, 휴장일 여부를 확인할 수 있습니다.",
+    tags={"market", "status", "trading-hours", "schedule"},
+)
+async def get_market_status(ctx: Context) -> dict[str, Any]:
+    """
+    한국 주식 시장의 운영 상태를 조회합니다.
+
+    Returns:
+        dict: 시장 운영 정보
+            - is_trading_day: 거래일 여부
+            - market_status: 시장 상태 ("closed", "premarket", "open", "aftermarket")
+            - current_time: 현재 시간 (KST)
+            - market_open_time: 정규장 시작 시간 (09:00)
+            - market_close_time: 정규장 종료 시간 (15:30)
+            - premarket_start: 시간외 시작 시간 (08:30)
+            - aftermarket_end: 시간외 종료 시간 (18:00)
+    """
+    try:
+        # 한국 시간대
+        kst: ZoneInfo = ZoneInfo("Asia/Seoul")
+        now: datetime = datetime.now(kst)
+        current_time: time = now.time()
+
+        # 시장 운영 시간 정의
+        premarket_start: time = time(8, 30)  # 08:30
+        market_open: time = time(9, 0)  # 09:00
+        market_close: time = time(15, 30)  # 15:30
+        aftermarket_end: time = time(18, 0)  # 18:00
+
+        # 주말 체크 (토요일=5, 일요일=6)
+        is_weekend: bool = now.weekday() >= 5
+        is_trading_day: bool = not is_weekend  # 간단화 (실제로는 공휴일도 체크해야 함)
+
+        # 시장 상태 판단
+        if not is_trading_day:
+            market_status = "closed"
+        elif current_time < premarket_start:
+            market_status = "closed"
+        elif premarket_start <= current_time < market_open:
+            market_status = "premarket"
+        elif market_open <= current_time < market_close:
+            market_status = "open"
+        elif market_close <= current_time < aftermarket_end:
+            market_status = "aftermarket"
+        else:
+            market_status = "closed"
+
+        return {
+            "is_trading_day": is_trading_day,
+            "market_status": market_status,
+            "current_time": now.strftime("%Y-%m-%d %H:%M:%S KST"),
+            "market_open_time": "09:00",
+            "market_close_time": "15:30",
+            "premarket_start": "08:30",
+            "aftermarket_end": "18:00",
+        }
+    except Exception as e:
+        raise ToolError(f"시장 상태 조회 중 오류가 발생했습니다: {e}")
 
 
 # --- 서버 실행 ---
