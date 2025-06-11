@@ -680,8 +680,8 @@ async def get_stock_chart(
                 chart_list.append(
                     {
                         "date": (
-                            str(candle.date)
-                            if hasattr(candle, "date") and candle.date
+                            candle.time_kst.strftime("%Y-%m-%d")
+                            if hasattr(candle, "time_kst") and candle.time_kst
                             else "N/A"
                         ),
                         "open": candle.open if hasattr(candle, "open") else 0,
